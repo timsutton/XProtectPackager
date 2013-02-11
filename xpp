@@ -1,0 +1,287 @@
+#!/usr/bin/python
+
+import urllib
+import os
+import sys
+import tempfile
+import subprocess
+import shutil
+import plistlib
+import optparse
+import re
+from dateutil.parser import parse
+from Foundation import CFPreferencesCopyAppValue, \
+                       CFPreferencesSetAppValue, \
+                       CFPreferencesAppSynchronize
+
+DEFAULTS = {'PackageIdentifier': 'com.github.ManagedXProtect',
+            'MunkiimportOptions': ['--subdirectory', 'support/ManagedXProtect',
+                                    '--unattended_install']
+            }
+APP_DOMAIN = 'com.github.XProtectPackager'
+
+def getPref(key):
+    to_return = None
+    if key in DEFAULTS.keys():
+        to_return = DEFAULTS[key]
+    value = CFPreferencesCopyAppValue(key, APP_DOMAIN)
+    if value:
+        to_return = value
+    return to_return
+
+def errorExit(err_string, err_code=1):
+    print err_string
+    sys.exit(err_code)
+
+def getPkgbuildPath():
+    path = None
+    for bin in ['/usr/bin/pkgbuild', '/Developer/usr/bin/pkgbuild']:
+        if os.path.exists(bin):
+            path = bin
+    return path
+
+class MetaPlistURLError(Exception):
+    pass
+
+class XProtectPackager():
+    AVAILABLE_VERSIONS = ['1', '2', '3']
+    def __init__(self, version, identifier, app_domain, output_dir):
+        self.app_domain = app_domain
+        self.output_dir = output_dir
+        self.urlinfo = None
+        self.last_modified_http = None
+        self.version = version
+        self.os_version = str(int(version) + 5)
+        self.meta_version = None
+        self.pkg_name = None
+        self.pkg_version = None
+        self.pkg_identifier = identifier
+        self.meta_plist, self.data_plist = None, None
+
+        # fetch metadata now so we have other version info available
+        self._storeUrlData()
+        if self.urlinfo.code != 200:
+            raise MetaPlistURLError
+        self._scrapePlist()
+        self._setPackageBuildInfo()
+
+    def _getURL(self):
+        return 'http://configuration.apple.com/configurations/macosx/xprotect/%s/clientConfiguration.plist' % self.version
+
+    def _storeUrlData(self):
+        self.urlinfo = urllib.urlopen(self._getURL())
+        self.last_modified_http = self.urlinfo.info().getheader('Last-Modified')
+
+    def _scrapePlist(self):
+        alldata = self.urlinfo.read()
+        start = alldata.find("<?xml")
+        config_plist = plistlib.readPlistFromString(alldata[start:])
+        self.meta_plist = config_plist['meta']
+        self.meta_plist['LastModification'] = self.last_modified_http
+        self.meta_version = self.meta_plist['Version']
+        self.data_plist = config_plist['data']
+
+    def _writePlists(self):
+        plistlib.writePlist(self.meta_plist,
+            os.path.join(self.plist_dest, 'XProtect.meta.plist'))
+        plistlib.writePlist(self.data_plist,
+            os.path.join(self.plist_dest, 'XProtect.plist'))
+
+    def _setPackageBuildInfo(self):
+        pkg_date = parse(self.last_modified_http)
+        version_date = "%d.%02d.%02d" % (pkg_date.year, pkg_date.month, pkg_date.day)
+        self.pkg_version = str(self.meta_version) + '.' + version_date
+        self.pkg_name = self.pkg_identifier.split('.')[-1]
+        output_file = "%s_10_%s-%s.pkg" % (self.pkg_name, self.os_version, self.pkg_version)
+        self.built_pkg_path = os.path.join(self.output_dir, output_file)
+
+    # def cacheData(self):
+    #     self._scrapePlist()
+    #     cache = {}
+    #     existing = CFPreferencesCopyAppValue('StoredVersions', self.app_domain)
+    #     if existing:
+    #         cache = existing.copy()
+    #     ver = str(self.meta_version)
+    #     cache[ver] = {}
+    #     cache[ver]['meta'] = self.meta_plist.copy()
+    #     cache[ver]['data'] = self.data_plist[:]
+    #     a = plistlib.writePlistToString(cache)
+    #     CFPreferencesSetAppValue('StoredVersions', a, self.app_domain)
+    #     CFPreferencesAppSynchronize(self.app_domain)
+
+    def _storeBuiltVersion(self):
+        ver = self.version
+
+        # Hoping there's smarter ways to do this, currently doing this tediously
+        # (using mutableCopy also doesn't seem to create a shallow copy):
+        # http://osdir.com/ml/python.pyobjc.devel/2003-10/msg00036.html
+        existing = CFPreferencesCopyAppValue('LastBuiltVersions', self.app_domain)
+        cache = {}
+        if existing:
+            cache.update(existing)
+        cache[ver] = {}
+        if existing and ver in existing.keys():
+            cache[ver].update(existing[ver])
+        cache[ver]['Version'] = self.meta_version
+        date = parse(self.last_modified_http)
+        cache[ver]['LastModified'] = date
+        CFPreferencesSetAppValue('LastBuiltVersions', cache, self.app_domain)
+        CFPreferencesAppSynchronize(self.app_domain)
+
+    def _clean(self):
+        shutil.rmtree(self.pkg_root)
+
+    def buildPkg(self):
+        # collect
+        if not self.meta_plist:
+            self._scrapePlist()
+
+        # stage
+        self.pkg_root = tempfile.mkdtemp(prefix='xprotectpkg-')
+        self.plist_dest = os.path.join(self.pkg_root,
+            'System/Library/CoreServices/CoreTypes.bundle/Contents/Resources')
+        os.makedirs(self.plist_dest)
+        self._writePlists()
+
+        # build
+        pkgbuild_path = getPkgbuildPath()
+        retcode = subprocess.call([pkgbuild_path,
+            '--identifier', self.pkg_identifier,
+            '--version', self.pkg_version,
+            '--root', self.pkg_root,
+            '--quiet',
+            self.built_pkg_path])
+        self._storeBuiltVersion()
+        self._clean()
+        return (retcode, self.built_pkg_path)
+
+    def munkiimport(self):
+        target_os = '10.%s' % self.os_version
+        cmd = ['/usr/local/munki/munkiimport', '--nointeractive']
+        cmd.extend(['--minimum-os-version', target_os,
+                    '--maximum-os-version', target_os + '.99'])
+        cmd.extend(['--name', self.pkg_name, '--displayname', self.pkg_name])
+        cmd.extend(getPref('MunkiimportOptions'))
+        cmd.append(self.built_pkg_path)
+        subprocess.call(cmd)
+
+
+
+def main():
+    usage = "%prog [--build [--munkiimport]] [options]"
+    o = optparse.OptionParser(usage=usage)
+    o.add_option('-b', '--build', action='store_true',
+        help="Build a package.")
+    o.add_option('-f', '--force', action='store_true',
+        help="Force building package even if it was previously built. \
+Build history is stored in the preferences for %s" % APP_DOMAIN)
+    o.add_option('--os', action='append',
+        help="Specify OS X version to build for, in the form '10.8'. \
+Can be specified multiple times. Default is to build all available versions.")
+    o.add_option('-o', '--output-dir', action='store',
+        help="Specify a directory to output packages. Default is the current \
+working directory. If --munkiimport is given, it will expect the package here.")
+    o.add_option('-m', '--munkiimport', action='store_true',
+        help="Import built packages into Munki. Default munkiimport flags: \
+'%s'" % ' '.join(DEFAULTS['MunkiimportOptions']))
+    opts, args = o.parse_args()
+
+    if not opts.build and not opts.munkiimport:
+        errorExit("At least one of '--build' or '--munkiimport' must be given!")
+
+    if not getPkgbuildPath():
+        errorExit("pkgbuild was not found on this system! Exiting..")
+
+    # check output dir
+    if opts.build or opts.munkiimport:
+        if opts.output_dir:
+            if not os.path.exists(opts.output_dir):
+                sys.exit("Output directory %s does not exist! Exiting.." % opts.output_dir)
+            output_dir = opts.output_dir
+        else:
+            output_dir = os.getcwd()
+
+    # handle versions given
+    vers = []
+    if opts.os:
+        for build_os in opts.os:
+            match = re.match("^10\.(\d){1}$", build_os)
+            if not match:
+                sys.exit("Got --os value %s. The --os option takes input of the form '10.8' only. Exiting.." % build_os)
+            xp_version = str(int(match.groups()[0]) - 5)
+            if xp_version not in XProtectPackager.AVAILABLE_VERSIONS:
+                sys.exit("OS X %s doesn't support XProtect. Exiting.." % build_os)
+            vers.append(str(int(build_os.split('.')[1]) - 5))
+    else:
+        vers = XProtectPackager.AVAILABLE_VERSIONS
+
+
+    # munkiimport sanity-check lifted from http://github.com/timsutton/aamporter
+    if opts.munkiimport:
+        MUNKI_DIR = '/usr/local/munki'
+        if not os.path.exists(MUNKI_DIR):
+            errorExit("No Munki installation could be found. Get it at http://code.google.com/p/munki")
+        sys.path.insert(0, MUNKI_DIR)
+        repo_path = CFPreferencesCopyAppValue('repo_path', 'com.googlecode.munki.munkiimport')
+        if not repo_path:
+            errorExit("Your Munki repo seems to not be configured. Run munkiimport --configure first.")
+        try:
+            import imp
+            # munkiimport doesn't end in .py, so we use imp to make it available to the import system
+            imp.load_source('munkiimport', os.path.join(MUNKI_DIR, 'munkiimport'))
+            import munkiimport
+        except ImportError:
+            errorExit("There was an error importing munkilib, which is needed for --munkiimport functionality.")
+        if not munkiimport.repoAvailable():
+            errorExit("The Munki repo cannot be located. This tool is not interactive; first ensure the repo is mounted.")
+
+
+    pkg_identifier = getPref('PackageIdentifier')
+    for v in vers:
+
+        x = XProtectPackager(version=v,
+                            app_domain=APP_DOMAIN,
+                            identifier=pkg_identifier,
+                            output_dir=output_dir)
+
+        if opts.build:
+            will_build = False
+            if opts.force:
+                will_build = True
+
+            last_versions = getPref('LastBuiltVersions')
+            if last_versions:
+                if not v in last_versions.keys():
+                    print "No previous version of v. %s has been built." % v
+                    will_build = True
+                else:
+                    print "The most recent version of v. %s built is version %s." % \
+                        (v, last_versions[v]['Version'])
+                    built_ns = last_versions[v]['LastModified']
+                    built_date = parse(str(built_ns))
+                    available_date = parse(x.last_modified_http)
+                    if available_date > built_date:
+                        print "A more recent version is available: %s, last modified %s." % \
+                            (x.meta_version, available_date)
+                        will_build = True
+                    else:
+                        print "No more recent versions are available."
+            else:
+                print "No history of stored builds."
+                will_build = True
+
+            if will_build:
+                print "Building package for XProtect version %s..." % v
+                (retcode, pkg_path) = x.buildPkg()
+                if retcode:
+                    print "There was an error building the package."
+                else:
+                    print "Built package at %s." % pkg_path
+
+        if opts.munkiimport:
+            print "Importing into Munki..."
+            x.munkiimport()
+
+
+if __name__ == '__main__':
+    main()
