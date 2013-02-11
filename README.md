@@ -23,7 +23,7 @@ The identifier 'com.github.ManagedXProtect' can be overridden by defaults (see b
 
 * METAVERSION should always increase with each metadata version, as `XProtectUpdater` checks this version for an incrementing value
 * METAVERSION increases by 1000 with each major OS version, so a client whose OS has been upgraded will see the next meta version as a logical version upgrade
-* the date of the last updated definition can be easily audited using the `pkgutil --pkg-info` command to retrieve the last installed version on a client
+* the date of the last updated definition on a client can be easily audited with a command like: `pkgutil --pkg-info com.github.ManagedXProtect`
 
 ## Requirements
 
