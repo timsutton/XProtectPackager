@@ -17,7 +17,7 @@ The package built by XProtect Packager contains only these two files, no postins
 `METAVERSION.YYYY.MM.DD`, where:
 
 * METAVERSION is the definition version listed in `XProtect.meta.plist`.
-* YYYY.MM.DD is the date the definition plist was last modified by Apple (this is used by `XProtectUpdater` to determine whether its definitions are up to date).
+* YYYY.MM.DD is the date the definition plist was last modified by Apple (this date is written into the meta plist by `XProtectUpdater`, although it appears to only trigger an update when the signature version has changed).
 
 The identifier 'com.github.ManagedXProtect' can be overridden by defaults (see below). The versioning scheme was chosen for the following reasons:
 

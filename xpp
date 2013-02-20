@@ -257,12 +257,9 @@ working directory. If --munkiimport is given, it will expect the package here.")
                 else:
                     print "The most recent version of v. %s built is version %s." % \
                         (v, last_versions[v]['Version'])
-                    built_ns = last_versions[v]['LastModified']
-                    built_date = parse(str(built_ns))
-                    available_date = parse(x.last_modified_http)
-                    if available_date > built_date:
-                        print "A more recent version is available: %s, last modified %s." % \
-                            (x.meta_version, available_date)
+                    if x.meta_version > last_versions[v]['Version']:
+                        print "A more recent version is available: %s, Last-Modified header: %s." % \
+                            (x.meta_version, x.last_modified_http)
                         will_build = True
                     else:
                         print "No more recent versions are available."
